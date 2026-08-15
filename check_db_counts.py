@@ -1,12 +1,12 @@
-import sqlite3
+from pathlib import Path
+import sys
 
-db = r"C:\Users\HP\Desktop\Mes Codes Recherche\BasesGeospatialeMultiModale\data\multimodal_base.sqlite"
-conn = sqlite3.connect(db)
-cur = conn.cursor()
-rows = cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-for (name,) in rows:
-    if name.startswith('sqlite'):
-        continue
-    count = cur.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
-    print(f"{name}: {count}")
-conn.close()
+SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from inspect_multimodal_database import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,3 +9,6 @@ __pycache__/
 *.log
 catboost_info/
 *.tmp
+data/*.sqlite
+data/workspace/
+reports/*.json
