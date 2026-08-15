@@ -1,107 +1,114 @@
 # Base multimodale agroécologique pour l’Afrique de l’Ouest et le Sénégal
 
-Ce projet met en place une base de données multimodale pour l’agroécologie en Afrique de l’Ouest et plus particulièrement au Sénégal, en intégrant :
+Ce dépôt construit une base SQLite multimodale, temporelle et géospatiale à partir des fichiers réellement présents dans le dépôt : CSV, Excel, archives ZIP, shapefiles éventuels contenus dans les ZIP, GeoPackage et GeoTIFF/TIFF si disponibles.
 
-- Données temporelles
-- Données spatiales
-- Données climatiques
-- Données pédologiques
-- Données agricoles
-- Données de télédétection (Sentinel, Landsat, MODIS)
-- Fichiers tabulaires et géospatiaux
-- Préparation d’indices spectraux
+## État réel du dépôt
 
-## Structure du dossier
+Les données actuellement présentes à la racine incluent notamment :
 
-- [config/project_config.py](config/project_config.py): paramètres globaux, limites géographiques, indices spectraux, ID projet Earth Engine
-- [scripts/create_multimodal_database.py](scripts/create_multimodal_database.py): création de la base SQLite
-- [scripts/download_gee_data.py](scripts/download_gee_data.py): téléchargement ciblé depuis Google Earth Engine
-- [scripts/download_cloud_data.py](scripts/download_cloud_data.py): téléchargement des données publiques depuis des plateformes cloud
-- [scripts/spectral_indices.py](scripts/spectral_indices.py): calcul des indices spectrales
-- [scripts/gee_scan_and_assets.py](scripts/gee_scan_and_assets.py): scan du dossier local et reconnaissance des collections GEE
-- [requirements.txt](requirements.txt): dépendances Python
+- `pluvio_statio-2023-2014.csv`
+- `temp_statio-2023-2014.csv`
+- `temporal_fold_year_ranges.csv`
+- `production-agricole-2003-2012.zip`
+- `point_eau_pastoraux.zip`
+- `unites_pastorales-2.zip`
+- `infra_socio_economique.zip`
 
-## Données actuelles déjà disponibles dans le dossier
+Le pipeline de ce dépôt scanne automatiquement un dossier configurable, détecte les formats pris en charge, extrait les archives ZIP, nettoie les colonnes et alimente une base SQLite unique.
 
-- [pluvio_statio-2023-2014.csv](pluvio_statio-2023-2014.csv): pluviométrie
-- [temp_statio-2023-2014.csv](temp_statio-2023-2014.csv): température
-- Archive [production-agricole-2003-2012.zip](production-agricole-2003-2012.zip): production agricole
-- Archive [point_eau_pastoraux.zip](point_eau_pastoraux.zip): points d’eau pastoraux
-- Archive [unites_pastorales-2.zip](unites_pastorales-2.zip): unités pastorales
-- Archive [infra_socio_economique.zip](infra_socio_economique.zip): infrastructures socio-économiques
+## Scripts disponibles
 
-## Limites géographiques
-
-- Sénégal: lon -17.6 to -11.3, lat 12.0 to 17.3
-- Afrique de l’Ouest: lon -20 to 20, lat -5 to 30
-
-## ID projet Google Earth Engine
-
-- project37246
-
-## Collections GEE utilisées
-
-- COPERNICUS/S2_SR_HARMONIZED
-- LANDSAT/LC08/C02/T1_L2
-- MODIS/061/MOD13A2
-- UCSB-CHG/CHIRPS/PENTAD
-- ECMWF/ERA5_LAND/HOURLY
-- OpenLandMap/soil
-- USGS/SRTMGL1_003
-
-## Indices spectraux inclus
-
-- NDVI
-- NDWI
-- EVI
-- SAVI
-- NDBI
-- MNDWI
+- `scripts/create_multimodal_database.py` : script principal de scan, nettoyage et ingestion SQLite
+- `scripts/ingestion_pipeline.py` : logique du pipeline
+- `scripts/inspect_multimodal_database.py` : inspection des tables et des nombres de lignes
+- `check_db_counts.py` : alias simple vers le script d’inspection
+- `multimodal_db_gui.py` : interface d’exploration de la base si une base SQLite existe déjà
 
 ## Dépendances
+
+Installation recommandée :
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Authentification GEE
+Remarques :
+
+- `pandas` et `openpyxl` sont utilisés pour les fichiers tabulaires.
+- `geopandas`, `fiona`, `shapely`, `pyproj` et `rasterio` améliorent l’ingestion géospatiale.
+- Si les dépendances géospatiales lourdes ne sont pas installées, le pipeline continue de fonctionner en mode dégradé : les couches vectorielles et rasters sont inventoriés et catalogués avec warnings, sans ingestion complète des géométries.
+
+## Construire la base SQLite
+
+Depuis la racine du dépôt :
 
 ```bash
-earthengine authenticate --project project37246
+python scripts/create_multimodal_database.py
 ```
 
-## Exécution
+Par défaut :
 
-### 1. Créer la base SQLite
+- si un dossier `upload/` existe, il sera scanné ;
+- sinon, c’est la racine actuelle du dépôt qui sera utilisée.
+
+Exemple avec chemins explicites :
 
 ```bash
-python scripts\create_multimodal_database.py
+python scripts/create_multimodal_database.py \
+  --source-dir /chemin/vers/les/donnees \
+  --db-path /chemin/vers/data/multimodal_base.sqlite \
+  --report-path /chemin/vers/reports/latest_ingestion_report.json
 ```
 
-### 2. Télécharger les données Sentinel / GEE
+## Sorties générées
+
+Le pipeline crée par défaut :
+
+- `data/multimodal_base.sqlite` : base SQLite consolidée
+- `reports/latest_ingestion_report.json` : rapport de scan/nettoyage/ingestion
+- `data/workspace/` : espace de travail pour les extractions ZIP
+
+## Schéma SQLite créé
+
+Le pipeline crée au minimum les tables de catalogue suivantes :
+
+- `data_sources`
+- `ingestion_runs`
+- `table_catalog`
+- `column_catalog`
+- `geospatial_layers`
+- `raster_catalog`
+
+Il crée aussi automatiquement une table nettoyée pour chaque source tabulaire pertinente, et une version `*_long` quand une table large contient principalement des colonnes annuelles (`2003`, `2004`, etc.).
+
+## Nettoyage et normalisation effectués
+
+Le pipeline :
+
+- détecte automatiquement les délimiteurs CSV (`;`, `,`, tabulation, etc.) ;
+- gère les encodages usuels (`utf-8-sig`, `utf-8`, `cp1252`, `latin-1`) ;
+- normalise les noms de colonnes en `snake_case` ASCII ;
+- tente de convertir les colonnes numériques et temporelles ;
+- identifie des rôles de colonnes (temporelles, spatiales, administratives, mesures) ;
+- extrait les ZIP dans un espace de travail dédié ;
+- catalogue les rasters et couches géospatiales ;
+- stocke les géométries vectorielles en `WKT` quand les dépendances géospatiales sont disponibles.
+
+## Vérifier la base générée
 
 ```bash
-python scripts\download_gee_data.py
+python scripts/inspect_multimodal_database.py
 ```
 
-### 3. Télécharger les données cloud publiques
+ou :
 
 ```bash
-python scripts\download_cloud_data.py
+python check_db_counts.py
 ```
 
-### 4. Calculer les indices spectraux
+## Limites actuelles
 
-```bash
-python scripts\spectral_indices.py
-```
-
-### 5. Scanner le dossier et explorer les collections GEE
-
-```bash
-python scripts\gee_scan_and_assets.py
-```
-
-## Remarque
-
-Les exportations Earth Engine sont lancées vers Google Drive avec le dossier `senegal_gee` pour validation avant envoi vers une asset ou un stockage local.
+- Les shapefiles et GeoPackage sont pleinement ingérés seulement si les dépendances géospatiales optionnelles sont installées.
+- Les rasters sont catalogués avec leurs métadonnées ; le pipeline ne charge pas les pixels en table SQLite.
+- Les CSV très irréguliers peuvent nécessiter un contrôle manuel du rapport JSON.
+- Le dépôt ne contient actuellement ni dossier `upload/` ni anciens scripts `config/` / `download_*` / `gee_*` mentionnés dans les versions précédentes du README.
