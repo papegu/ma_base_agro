@@ -68,8 +68,9 @@ def utc_now() -> str:
 
 def normalize_name(value: str, prefix: str = "field") -> str:
     text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.replace("\ufeff", "")
     text = text.encode("ascii", "ignore").decode("ascii")
-    text = text.strip().lower().replace("\ufeff", "")
+    text = text.strip().lower()
     if YEAR_COLUMN_RE.match(text):
         return f"year_{text}"
     text = re.sub(r"[^a-z0-9]+", "_", text)
@@ -83,12 +84,21 @@ def normalize_name(value: str, prefix: str = "field") -> str:
 
 def uniquify_names(names: list[str], prefix: str = "field") -> list[str]:
     seen: dict[str, int] = {}
+    used: set[str] = set()
     result: list[str] = []
     for name in names:
         base = normalize_name(name, prefix=prefix)
         count = seen.get(base, 0)
-        seen[base] = count + 1
-        result.append(base if count == 0 else f"{base}_{count + 1}")
+        candidate = base
+        if candidate in used:
+            while True:
+                count += 1
+                candidate = f"{base}_{count + 1}"
+                if candidate not in used:
+                    break
+        seen[base] = count
+        used.add(candidate)
+        result.append(candidate)
     return result
 
 
@@ -398,16 +408,22 @@ class MultimodalIngestionPipeline:
 
         with zipfile.ZipFile(archive_path) as archive:
             members = [name for name in archive.namelist() if not name.endswith("/") and "__MACOSX" not in name]
-            archive.extractall(extract_root, members=members)
+            extract_root_resolved = extract_root.resolve()
+            for member in members:
+                destination = (extract_root / member).resolve()
+                if not destination.is_relative_to(extract_root_resolved):
+                    raise ValueError(f"Archive member outside extraction root refused: {member}")
+                archive.extract(member, path=extract_root)
 
         nested_paths = sorted(
             path for path in extract_root.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS - ARCHIVE_EXTENSIONS
         )
         for extracted_path in nested_paths:
+            extracted_type = detect_file_type(extracted_path)
             child_source_id = self._record_source(
                 source_name=extracted_path.name,
                 source_path=f"{archive_path}!{extracted_path.relative_to(extract_root).as_posix()}",
-                detected_type=detect_file_type(extracted_path),
+                detected_type=extracted_type,
                 parent_archive=str(archive_path),
                 extracted_path=str(extracted_path),
                 size_bytes=extracted_path.stat().st_size,
@@ -418,7 +434,7 @@ class MultimodalIngestionPipeline:
             self._process_registered_source(
                 extracted_path,
                 child_source_id,
-                detect_file_type(extracted_path),
+                extracted_type,
                 original_reference=f"{archive_path}!{extracted_path.relative_to(extract_root).as_posix()}",
             )
 
@@ -453,7 +469,7 @@ class MultimodalIngestionPipeline:
         sha256 = None
         if extracted_path and Path(extracted_path).exists():
             sha256 = self._hash_file(Path(extracted_path))
-        elif Path(source_path).exists():
+        elif parent_archive is None and Path(source_path).exists():
             sha256 = self._hash_file(Path(source_path))
         cursor = self.conn.execute(
             """
@@ -497,12 +513,11 @@ class MultimodalIngestionPipeline:
         ensure_pandas()
         sheets = self._read_tabular(path)
         for sheet_name, frame, cleanup_actions in sheets:
-            original_columns = [str(column) for column in frame.columns]
-            cleaned = self._clean_dataframe(frame)
+            cleaned, column_pairs = self._clean_dataframe(frame)
             table_name = self._make_table_name(path, sheet_name)
             self._write_dataframe(cleaned, table_name)
             self._catalog_table(source_id, table_name, "tabular", cleaned, notes="; ".join(cleanup_actions))
-            self._catalog_columns(table_name, original_columns, cleaned)
+            self._catalog_columns(table_name, column_pairs, cleaned)
             self.report["tables_created"].append(
                 {
                     "source": source_reference,
@@ -518,7 +533,7 @@ class MultimodalIngestionPipeline:
                 long_name = self._dedupe_table_name(f"{table_name}_long")
                 self._write_dataframe(long_table, long_name)
                 self._catalog_table(source_id, long_name, "tabular_long", long_table, notes="Normalized wide year columns")
-                self._catalog_columns(long_name, list(long_table.columns), long_table)
+                self._catalog_columns(long_name, [(str(column), str(column)) for column in long_table.columns], long_table)
                 self.report["tables_created"].append(
                     {
                         "source": source_reference,
@@ -549,11 +564,18 @@ class MultimodalIngestionPipeline:
             sheets.append((sheet_name, frame, [f"read excel sheet={sheet_name}"]))
         return sheets
 
-    def _clean_dataframe(self, frame: "pd.DataFrame") -> "pd.DataFrame":
+    def _clean_dataframe(self, frame: "pd.DataFrame") -> tuple["pd.DataFrame", list[tuple[str, str]]]:
         assert pd is not None
         cleaned = frame.copy()
-        cleaned.columns = uniquify_names([str(column) for column in cleaned.columns], prefix="column")
-        cleaned = cleaned.dropna(axis=1, how="all")
+        original_columns = [str(column) for column in cleaned.columns]
+        normalized_columns = uniquify_names(original_columns, prefix="column")
+        cleaned.columns = normalized_columns
+        retained_pairs = [
+            (original_name, normalized_name)
+            for original_name, normalized_name in zip(original_columns, normalized_columns)
+            if not cleaned[normalized_name].isna().all()
+        ]
+        cleaned = cleaned[[normalized_name for _, normalized_name in retained_pairs]].copy()
         for column in cleaned.columns:
             series = cleaned[column]
             if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
@@ -568,7 +590,7 @@ class MultimodalIngestionPipeline:
                     errors="coerce",
                 )
                 if normalized.notna().sum() and numeric_candidate.notna().sum() / normalized.notna().sum() >= 0.85:
-                    if numeric_candidate.dropna().apply(float.is_integer).all():
+                    if (numeric_candidate.dropna() % 1 == 0).all():
                         cleaned[column] = numeric_candidate.astype("Int64")
                     else:
                         cleaned[column] = numeric_candidate.astype(float)
@@ -576,17 +598,20 @@ class MultimodalIngestionPipeline:
 
                 datetime_candidate = pd.to_datetime(normalized, errors="coerce", utc=False, format="mixed")
                 if normalized.notna().sum() and datetime_candidate.notna().sum() / normalized.notna().sum() >= 0.85:
-                    cleaned[column] = datetime_candidate.dt.strftime("%Y-%m-%d %H:%M:%S").replace("NaT", pd.NA)
+                    cleaned[column] = datetime_candidate.dt.strftime("%Y-%m-%d %H:%M:%S").where(
+                        datetime_candidate.notna(),
+                        other=pd.NA,
+                    )
                     continue
                 cleaned[column] = normalized
-        return cleaned
+        return cleaned, retained_pairs
 
     def _create_long_year_table(self, frame: "pd.DataFrame") -> "pd.DataFrame | None":
         assert pd is not None
         year_columns = [column for column in frame.columns if NORMALIZED_YEAR_COLUMN_RE.match(str(column)) or YEAR_COLUMN_RE.match(str(column))]
         if len(year_columns) < 2:
             return None
-        if len(year_columns) < max(2, len(frame.columns) // 2):
+        if len(year_columns) <= len(frame.columns) / 2:
             return None
         id_columns = [column for column in frame.columns if column not in year_columns]
         long_frame = frame.melt(id_vars=id_columns, value_vars=year_columns, var_name="year", value_name="value")
@@ -626,11 +651,11 @@ class MultimodalIngestionPipeline:
                 cleaned = cleaned.drop(columns="geometry")
                 cleaned["geometry_wkt"] = geometry.apply(lambda value: value.wkt if value is not None else None)
                 cleaned["geometry_type"] = geometry.geom_type
-            cleaned = self._clean_dataframe(cleaned)
+            cleaned, column_pairs = self._clean_dataframe(cleaned)
             table_name = self._make_table_name(path, layer_label)
             self._write_dataframe(cleaned, table_name)
             self._catalog_table(source_id, table_name, "vector", cleaned, notes="geometry stored as WKT")
-            self._catalog_columns(table_name, list(cleaned.columns), cleaned)
+            self._catalog_columns(table_name, column_pairs, cleaned)
 
             geometry_types = None
             bounds = None
@@ -695,7 +720,14 @@ class MultimodalIngestionPipeline:
                 height=dataset.height,
                 band_count=dataset.count,
                 dtype=",".join(dataset.dtypes),
-                bounds=json.dumps(list(dataset.bounds)),
+                bounds=json.dumps(
+                    {
+                        "left": dataset.bounds.left,
+                        "bottom": dataset.bounds.bottom,
+                        "right": dataset.bounds.right,
+                        "top": dataset.bounds.top,
+                    }
+                ),
                 status="catalogued",
                 message=None,
             )
@@ -741,9 +773,9 @@ class MultimodalIngestionPipeline:
         )
         self.conn.commit()
 
-    def _catalog_columns(self, table_name: str, original_columns: list[str], frame: "pd.DataFrame") -> None:
+    def _catalog_columns(self, table_name: str, column_pairs: list[tuple[str, str]], frame: "pd.DataFrame") -> None:
         assert self.conn is not None
-        for original_name, column_name in zip(original_columns, frame.columns):
+        for original_name, column_name in column_pairs:
             series = frame[column_name]
             self.conn.execute(
                 """

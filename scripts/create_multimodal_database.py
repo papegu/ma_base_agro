@@ -29,10 +29,12 @@ def main() -> int:
         workspace_dir=Path(args.workspace_dir).resolve(),
     )
     report = MultimodalIngestionPipeline(config).run()
-    print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
-    print(f"Base SQLite créée: {config.db_path}")
-    print(f"Rapport JSON créé: {config.report_path}")
-    return 0
+    summary = report.get("summary", {})
+    status = "terminée avec succès" if summary.get("errors", 0) == 0 else "terminée avec erreurs"
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"Ingestion {status}: {config.db_path}")
+    print(f"Rapport JSON: {config.report_path}")
+    return 0 if summary.get("errors", 0) == 0 else 1
 
 
 if __name__ == "__main__":
