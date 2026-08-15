@@ -1,0 +1,11 @@
+.venv/
+.venv_tf/
+__pycache__/
+.vscode/
+.idea/
+*.pyc
+*.pyo
+*.pyd
+*.log
+catboost_info/
+*.tmp
