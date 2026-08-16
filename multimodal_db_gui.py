@@ -1,12 +1,16 @@
 import os
 import sqlite3
 import sys
+import threading
+import webbrowser
+from contextlib import suppress
 from pathlib import Path
 from tkinter import ttk
 
 import numpy as np
 from PIL import Image, ImageOps, ImageTk
 from tkinter import *
+from tkinter import messagebox
 from PIL import Image  # noqa: F811 - tkinter's own Image class shadows PIL's; restore it
 
 try:
@@ -50,7 +54,10 @@ class MultimodalDBApp:
 
         Label(self.topbar, text="Base de données SQLite", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         Label(self.topbar, text=f"Fichier: {DB_PATH}", fg="#4a4a4a").pack(anchor="w")
-        Button(self.topbar, text="Fenêtre de présentation", command=self.open_presentation_window, bg="#dfeeff", fg="#123", relief="raised").pack(anchor="e", pady=(6, 0))
+        button_row = Frame(self.topbar, bg="#f3f5f8")
+        button_row.pack(anchor="e", pady=(6, 0))
+        Button(button_row, text="Interface web", command=self.launch_web_interface, bg="#dfeeff", fg="#123", relief="raised").pack(side="left")
+        Button(button_row, text="Fenêtre de présentation", command=self.open_presentation_window, bg="#dfeeff", fg="#123", relief="raised").pack(side="left", padx=(6, 0))
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -71,28 +78,57 @@ class MultimodalDBApp:
     def build_overview_tab(self):
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="Vue d'ensemble")
+        self.current_table = None
 
         left = ttk.Frame(frame, padding=10)
         left.pack(side="left", fill="y")
 
-        ttk.Label(left, text="Tables disponibles").pack(anchor="w")
-        self.table_listbox = Listbox(left, width=30, height=20, exportselection=False)
+        ttk.Label(left, text="Tables disponibles", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.table_listbox = Listbox(left, width=32, height=22, exportselection=False)
         self.table_listbox.pack(fill="y", pady=(5, 10))
         self.table_listbox.bind("<<ListboxSelect>>", self.on_table_select)
+
+        ttk.Label(left, text="Statistiques globales", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.overview_stats = Text(left, height=16, width=32, wrap="word", relief="solid", borderwidth=1)
+        self.overview_stats.pack(fill="x", pady=(5, 0))
 
         right = ttk.Frame(frame, padding=10)
         right.pack(side="left", fill="both", expand=True)
 
-        ttk.Label(right, text="Statistiques globales").pack(anchor="w")
-        self.overview_stats = Text(right, height=28, width=90, wrap="word")
-        self.overview_stats.pack(fill="both", expand=True, pady=(5, 0))
+        self.selected_table_var = StringVar(value="Sélectionnez une table à gauche")
+        ttk.Label(right, textvariable=self.selected_table_var, font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
-        self.overview_tree = ttk.Treeview(right, columns=("colonne", "valeur"), show="headings")
-        self.overview_tree.heading("colonne", text="Colonne")
-        self.overview_tree.heading("valeur", text="Valeur")
-        self.overview_tree.column("colonne", width=220, anchor="w")
-        self.overview_tree.column("valeur", width=160, anchor="e")
-        self.overview_tree.pack(fill="both", expand=True, pady=(10, 0))
+        toolbar = ttk.Frame(right)
+        toolbar.pack(fill="x", pady=(8, 4))
+        ttk.Button(toolbar, text="Actualiser", command=self.refresh_current_table).pack(side="left")
+        ttk.Button(toolbar, text="Ajouter une ligne", command=self.add_row_dialog).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Modifier la ligne sélectionnée", command=self.edit_row_dialog).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Supprimer la ligne sélectionnée", command=self.delete_selected_row).pack(side="left", padx=(6, 0))
+
+        schema_toolbar = ttk.Frame(right)
+        schema_toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Button(schema_toolbar, text="Nouvelle table", command=self.open_new_table_dialog).pack(side="left")
+        ttk.Button(schema_toolbar, text="Modifier la structure", command=self.open_alter_table_dialog).pack(side="left", padx=(6, 0))
+        ttk.Button(schema_toolbar, text="Supprimer la table", command=self.drop_current_table).pack(side="left", padx=(6, 0))
+        ttk.Button(schema_toolbar, text="Requête SQL", command=self.open_sql_console).pack(side="left", padx=(6, 0))
+
+        tree_container = ttk.Frame(right)
+        tree_container.pack(fill="both", expand=True)
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
+
+        overview_vsb = ttk.Scrollbar(tree_container, orient="vertical")
+        overview_hsb = ttk.Scrollbar(tree_container, orient="horizontal")
+        self.overview_tree = ttk.Treeview(
+            tree_container, show="headings",
+            yscrollcommand=overview_vsb.set, xscrollcommand=overview_hsb.set,
+        )
+        overview_vsb.configure(command=self.overview_tree.yview)
+        overview_hsb.configure(command=self.overview_tree.xview)
+        self.overview_tree.grid(row=0, column=0, sticky="nsew")
+        overview_vsb.grid(row=0, column=1, sticky="ns")
+        overview_hsb.grid(row=1, column=0, sticky="ew")
+        self.overview_tree.bind("<Double-1>", lambda event: self.edit_row_dialog())
 
     def build_climate_tab(self):
         frame = ttk.Frame(self.notebook)
@@ -236,8 +272,252 @@ class MultimodalDBApp:
         if not selection:
             return
         table_name = self.table_listbox.get(selection[0])
-        rows = self.fetch_table(table_name, limit=50)
-        self.display_rows_in_tree(self.overview_tree, rows, table_name)
+        self.current_table = table_name
+        self.load_table_data(table_name)
+
+    def load_table_data(self, table_name, limit=500):
+        columns = self.get_columns(table_name)
+        try:
+            rows = self.conn.execute(f'SELECT rowid, * FROM "{table_name}" LIMIT {limit}').fetchall()
+            total = self.conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible de lire la table {table_name}:\n{exc}")
+            return
+
+        suffix = f" (affichage limité à {limit})" if total > limit else ""
+        self.selected_table_var.set(f"{table_name} — {total} ligne(s){suffix}")
+
+        tree = self.overview_tree
+        for child in tree.get_children():
+            tree.delete(child)
+        tree.configure(columns=columns)
+        for column in columns:
+            tree.heading(column, text=column)
+            tree.column(column, width=140, anchor="w")
+        for record in rows:
+            rowid, *values = record
+            display_values = ["" if v is None else str(v) for v in values]
+            tree.insert("", "end", iid=str(rowid), values=display_values)
+
+    def refresh_current_table(self):
+        if self.current_table:
+            self.load_table_data(self.current_table)
+
+    def add_row_dialog(self):
+        if not self.current_table:
+            messagebox.showinfo("Aucune table", "Sélectionnez d'abord une table dans la liste.")
+            return
+        columns = [c for c in self.get_columns(self.current_table) if c.lower() != "id"]
+
+        def on_submit(values):
+            self.insert_row(self.current_table, values)
+
+        RowFormDialog(self.root, f"Ajouter une ligne — {self.current_table}", columns, on_submit=on_submit)
+
+    def edit_row_dialog(self):
+        if not self.current_table:
+            return
+        selection = self.overview_tree.selection()
+        if not selection:
+            messagebox.showinfo("Aucune sélection", "Sélectionnez une ligne à modifier.")
+            return
+        rowid = selection[0]
+        columns = [c for c in self.get_columns(self.current_table) if c.lower() != "id"]
+        record = self.conn.execute(f'SELECT {", ".join(f"\"{c}\"" for c in columns)} FROM "{self.current_table}" WHERE rowid=?', (rowid,)).fetchone()
+        if record is None:
+            messagebox.showerror("Erreur", "Ligne introuvable (a-t-elle déjà été supprimée ?).")
+            return
+        initial_values = dict(zip(columns, record))
+
+        def on_submit(values):
+            self.update_row(self.current_table, rowid, values)
+
+        RowFormDialog(self.root, f"Modifier la ligne (id={rowid}) — {self.current_table}", columns, initial_values=initial_values, on_submit=on_submit)
+
+    def delete_selected_row(self):
+        if not self.current_table:
+            return
+        selection = self.overview_tree.selection()
+        if not selection:
+            messagebox.showinfo("Aucune sélection", "Sélectionnez une ou plusieurs lignes à supprimer.")
+            return
+        if not messagebox.askyesno("Confirmer la suppression", f"Supprimer {len(selection)} ligne(s) de la table {self.current_table} ?"):
+            return
+        try:
+            for rowid in selection:
+                self.conn.execute(f'DELETE FROM "{self.current_table}" WHERE rowid=?', (rowid,))
+            self.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Suppression impossible:\n{exc}")
+            return
+        self.refresh_current_table()
+        self.load_overview_stats()
+
+    def insert_row(self, table_name, values):
+        columns = list(values.keys())
+        coerced = [self._coerce_value(values[col]) for col in columns]
+        placeholders = ",".join(["?"] * len(columns))
+        col_list = ",".join(f'"{c}"' for c in columns)
+        try:
+            self.conn.execute(f'INSERT INTO "{table_name}"({col_list}) VALUES({placeholders})', coerced)
+            self.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Insertion impossible:\n{exc}")
+            return
+        self.refresh_current_table()
+        self.load_overview_stats()
+
+    def update_row(self, table_name, rowid, values):
+        columns = list(values.keys())
+        coerced = [self._coerce_value(values[col]) for col in columns]
+        set_clause = ",".join(f'"{c}"=?' for c in columns)
+        try:
+            self.conn.execute(f'UPDATE "{table_name}" SET {set_clause} WHERE rowid=?', (*coerced, rowid))
+            self.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Modification impossible:\n{exc}")
+            return
+        self.refresh_current_table()
+
+    @staticmethod
+    def _coerce_value(text):
+        if isinstance(text, str):
+            text = text.strip()
+        if text in ("", None):
+            return None
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return text
+
+    def open_new_table_dialog(self):
+        def on_submit(table_name, columns):
+            if not table_name.isidentifier():
+                messagebox.showerror("Erreur", "Nom de table invalide.")
+                return
+            if not columns:
+                messagebox.showerror("Erreur", "Ajoutez au moins une colonne.")
+                return
+            if not all(name.isidentifier() for name, _ in columns):
+                messagebox.showerror("Erreur", "Nom de colonne invalide.")
+                return
+            if self.table_exists(table_name):
+                messagebox.showerror("Erreur", "Une table avec ce nom existe déjà.")
+                return
+            cols_sql = ", ".join(f'"{name}" {col_type}' for name, col_type in columns)
+            try:
+                self.conn.execute(f'CREATE TABLE "{table_name}" (id INTEGER PRIMARY KEY AUTOINCREMENT, {cols_sql})')
+                self.conn.commit()
+            except Exception as exc:
+                messagebox.showerror("Erreur", f"Création impossible:\n{exc}")
+                return
+            self.load_table_list()
+            self.load_overview_stats()
+            messagebox.showinfo("Succès", f"Table {table_name} créée.")
+
+        CreateTableDialog(self.root, on_submit)
+
+    def drop_current_table(self):
+        if not self.current_table:
+            messagebox.showinfo("Aucune table", "Sélectionnez d'abord une table dans la liste.")
+            return
+        table_name = self.current_table
+        if not messagebox.askyesno("Confirmer", f"Supprimer DÉFINITIVEMENT la table '{table_name}' et toutes ses données ?"):
+            return
+        try:
+            self.conn.execute(f'DROP TABLE "{table_name}"')
+            self.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Suppression impossible:\n{exc}")
+            return
+        self.current_table = None
+        self.selected_table_var.set("Sélectionnez une table à gauche")
+        for child in self.overview_tree.get_children():
+            self.overview_tree.delete(child)
+        self.overview_tree.configure(columns=())
+        self.load_table_list()
+        self.load_overview_stats()
+
+    def open_alter_table_dialog(self):
+        if not self.current_table:
+            messagebox.showinfo("Aucune table", "Sélectionnez d'abord une table dans la liste.")
+            return
+        table_name = self.current_table
+        columns = self.get_columns(table_name)
+
+        def on_add_column(col_name, col_type):
+            if not col_name.isidentifier():
+                messagebox.showerror("Erreur", "Nom de colonne invalide.")
+                return
+            try:
+                self.conn.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{col_name}" {col_type}')
+                self.conn.commit()
+            except Exception as exc:
+                messagebox.showerror("Erreur", f"Ajout impossible:\n{exc}")
+                return
+            self.refresh_current_table()
+            messagebox.showinfo("Succès", f"Colonne {col_name} ajoutée.")
+
+        def on_drop_column(col_name):
+            if not col_name:
+                return
+            if not messagebox.askyesno("Confirmer", f"Supprimer la colonne '{col_name}' ?"):
+                return
+            try:
+                self.conn.execute(f'ALTER TABLE "{table_name}" DROP COLUMN "{col_name}"')
+                self.conn.commit()
+            except Exception as exc:
+                messagebox.showerror("Erreur", f"Suppression impossible:\n{exc}")
+                return
+            self.refresh_current_table()
+
+        def on_rename_table(new_name):
+            if not new_name.isidentifier():
+                messagebox.showerror("Erreur", "Nom de table invalide.")
+                return
+            if self.table_exists(new_name):
+                messagebox.showerror("Erreur", "Une table avec ce nom existe déjà.")
+                return
+            try:
+                self.conn.execute(f'ALTER TABLE "{table_name}" RENAME TO "{new_name}"')
+                self.conn.commit()
+            except Exception as exc:
+                messagebox.showerror("Erreur", f"Renommage impossible:\n{exc}")
+                return
+            self.current_table = new_name
+            self.load_table_list()
+            self.load_table_data(new_name)
+
+        AlterTableDialog(self.root, table_name, columns, on_add_column, on_drop_column, on_rename_table)
+
+    def open_sql_console(self):
+        def on_change():
+            self.load_table_list()
+            self.load_overview_stats()
+            self.refresh_current_table()
+
+        SqlConsoleWindow(self.root, self.conn, on_change=on_change)
+
+    def launch_web_interface(self):
+        if getattr(self, "_web_thread", None) and self._web_thread.is_alive():
+            webbrowser.open("http://127.0.0.1:5050")
+            return
+        try:
+            from scripts.db_web_admin import app as web_app
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Interface web indisponible:\n{exc}")
+            return
+
+        def run_server():
+            web_app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
+
+        self._web_thread = threading.Thread(target=run_server, daemon=True)
+        self._web_thread.start()
+        webbrowser.open("http://127.0.0.1:5050")
 
     def on_geotiff_select(self, event):
         selection = self.geotiff_list.curselection()
@@ -264,37 +544,12 @@ class MultimodalDBApp:
         layer_id = self.vector_id_by_label.get(item)
         self.display_vector_preview(layer_id)
 
-    def fetch_table(self, table_name, limit=100):
-        try:
-            columns = self.get_columns(table_name)
-            query = f"SELECT * FROM \"{table_name}\" LIMIT {limit}"
-            result = self.conn.execute(query).fetchall()
-            return columns, result
-        except Exception as exc:
-            print(f"Erreur sur table {table_name}: {exc}")
-            return [], []
-
     def get_columns(self, table_name):
         try:
             cols = self.conn.execute(f"PRAGMA table_info(\"{table_name}\")").fetchall()
             return [c[1] for c in cols]
         except Exception:
             return []
-
-    def display_rows_in_tree(self, tree, rows, title):
-        for child in tree.get_children():
-            tree.delete(child)
-
-        columns, data = rows
-        if not columns:
-            return
-        tree.configure(columns=columns)
-        for column in columns:
-            tree.heading(column, text=column)
-            tree.column(column, width=140, anchor="w")
-        for record in data[:30]:
-            values = ["" if v is None else str(v) for v in record]
-            tree.insert("", "end", values=values)
 
     def set_table_view(self, tree, columns, rows):
         for child in tree.get_children():
@@ -335,16 +590,10 @@ class MultimodalDBApp:
 
         self.overview_stats.delete(1.0, END)
         self.overview_stats.insert(END, "Résumé de la base multimodale\n\n")
+        self.overview_stats.insert(END, f"Tables: {len(stats)}\n")
+        self.overview_stats.insert(END, f"Lignes totales: {sum(count for _, count in stats)}\n\n")
         for name, count in stats:
             self.overview_stats.insert(END, f"- {name}: {count} lignes\n")
-
-        for child in self.overview_tree.get_children():
-            self.overview_tree.delete(child)
-        self.overview_tree.insert("", "end", values=("Nombre total de tables", str(len(stats))))
-        self.overview_tree.insert("", "end", values=("Données climatiques", self.conn.execute("SELECT COUNT(*) FROM climate").fetchone()[0]))
-        self.overview_tree.insert("", "end", values=("Données agricoles", self.conn.execute("SELECT COUNT(*) FROM agriculture").fetchone()[0]))
-        self.overview_tree.insert("", "end", values=("Articles référencés", self.conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0] if self.table_exists("articles") else 0))
-        self.overview_tree.insert("", "end", values=("Fichiers article", self.conn.execute("SELECT COUNT(*) FROM article_files").fetchone()[0] if self.table_exists("article_files") else 0))
 
     def table_exists(self, table_name):
         result = self.conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()[0]
@@ -485,11 +734,11 @@ class MultimodalDBApp:
             self._clear_geotiff_preview("Aperçu indisponible\n(rasterio ou fichier manquant)")
             return
 
-        default_label = labels[0]
-        for label, option in self.geotiff_band_options.items():
-            if option[0] == "formula" and option[1] == (spectral_index or "").upper():
-                default_label = label
-                break
+        default_label = next(
+            (label for label, option in self.geotiff_band_options.items()
+             if option[0] == "formula" and option[1] == (spectral_index or "").upper()),
+            labels[0],
+        )
         self.geotiff_index_var.set(default_label)
         self.render_geotiff_selection(file_path, self.geotiff_band_options[default_label])
 
@@ -573,33 +822,7 @@ class MultimodalDBApp:
         kind = option[0]
         try:
             with rasterio.open(file_path) as src:
-                if kind == "band":
-                    band_index = option[1]
-                    array = src.read(band_index).astype(np.float32)
-                    pil_image = self._normalize_to_gray_image(array)
-                elif kind == "formula":
-                    index_name = option[1]
-                    roles = option[2]
-                    bands = {role: src.read(band_idx).astype(np.float32) for role, band_idx in roles.items()}
-                    values = self._compute_spectral_index(index_name, bands)
-                    pil_image = self._normalize_to_gray_image(values, colorize=True)
-                    stats_text = f"Indice {index_name} calculé — min={np.nanmin(values):.3f}, max={np.nanmax(values):.3f}, moyenne={np.nanmean(values):.3f}"
-                    self.geotiff_info.insert(END, f"\n{stats_text}\n")
-                else:
-                    arr = src.read()
-                    if arr.size == 0:
-                        raise ValueError("Raster vide")
-                    if arr.ndim == 3 and arr.shape[0] >= 3:
-                        rgb = arr[:3].astype(np.float32)
-                        rgb = np.clip(rgb, 0, np.nanmax(rgb))
-                        rgb = (rgb - np.nanmin(rgb)) / (np.nanmax(rgb) - np.nanmin(rgb) + 1e-8)
-                        rgb = np.nan_to_num(rgb, nan=0.0)
-                        rgb = (rgb * 255).astype(np.uint8)
-                        rgb = np.moveaxis(rgb, 0, -1)
-                        pil_image = Image.fromarray(rgb)
-                    else:
-                        band = arr[0] if arr.ndim == 3 else arr
-                        pil_image = self._normalize_to_gray_image(band.astype(np.float32))
+                pil_image = self._build_geotiff_preview_image(src, kind, option)
 
             if pil_image.mode != 'RGB':
                 pil_image = ImageOps.autocontrast(pil_image.convert('L')).convert('RGB')
@@ -609,6 +832,37 @@ class MultimodalDBApp:
             self.geotiff_preview.image = img_tk
         except Exception as exc:
             self._clear_geotiff_preview(f"Aperçu non disponible\n{exc}")
+
+    def _build_geotiff_preview_image(self, src, kind, option):
+        if kind == "band":
+            band_index = option[1]
+            array = src.read(band_index).astype(np.float32)
+            return self._normalize_to_gray_image(array)
+
+        if kind == "formula":
+            index_name = option[1]
+            roles = option[2]
+            bands = {role: src.read(band_idx).astype(np.float32) for role, band_idx in roles.items()}
+            values = self._compute_spectral_index(index_name, bands)
+            pil_image = self._normalize_to_gray_image(values, colorize=True)
+            stats_text = f"Indice {index_name} calculé — min={np.nanmin(values):.3f}, max={np.nanmax(values):.3f}, moyenne={np.nanmean(values):.3f}"
+            self.geotiff_info.insert(END, f"\n{stats_text}\n")
+            return pil_image
+
+        arr = src.read()
+        if arr.size == 0:
+            raise ValueError("Raster vide")
+        if arr.ndim == 3 and arr.shape[0] >= 3:
+            rgb = arr[:3].astype(np.float32)
+            rgb = np.clip(rgb, 0, np.nanmax(rgb))
+            rgb = (rgb - np.nanmin(rgb)) / (np.nanmax(rgb) - np.nanmin(rgb) + 1e-8)
+            rgb = np.nan_to_num(rgb, nan=0.0)
+            rgb = (rgb * 255).astype(np.uint8)
+            rgb = np.moveaxis(rgb, 0, -1)
+            return Image.fromarray(rgb)
+
+        band = arr[0] if arr.ndim == 3 else arr
+        return self._normalize_to_gray_image(band.astype(np.float32))
 
     def _normalize_to_gray_image(self, array, colorize=False):
         norm = array.astype(np.float32)
@@ -674,9 +928,8 @@ class MultimodalDBApp:
         index = {}
         skip_dirs = {".venv", ".venv_tf", "__pycache__", ".git", "node_modules"}
         for shp_path in PROJECT_ROOT.rglob("*.shp"):
-            if any(part in skip_dirs for part in shp_path.parts):
-                continue
-            index.setdefault(shp_path.stem.lower(), shp_path)
+            if not any(part in skip_dirs for part in shp_path.parts):
+                index.setdefault(shp_path.stem.lower(), shp_path)
         self._shapefile_index = index
         return index
 
@@ -688,25 +941,25 @@ class MultimodalDBApp:
         index = self._index_local_shapefiles()
         local_path = index.get((layer_name or "").lower())
         if local_path and local_path.exists():
-            try:
+            with suppress(Exception):
                 return pyshp.Reader(str(local_path))
-            except Exception:
-                pass
 
         if file_path and file_path.lower().endswith(".zip") and os.path.exists(file_path):
             try:
                 with zipfile.ZipFile(file_path) as zf:
                     names = zf.namelist()
-                    target = None
-                    for name in names:
-                        if name.lower().endswith(".shp") and Path(name).stem.lower() == (layer_name or "").lower():
-                            target = Path(name).with_suffix("")
-                            break
+                    target = next(
+                        (
+                            Path(name).with_suffix("") for name in names
+                            if name.lower().endswith(".shp") and Path(name).stem.lower() == (layer_name or "").lower()
+                        ),
+                        None,
+                    )
                     if target is not None:
-                        shp_bytes = io.BytesIO(zf.read(str(target) + ".shp"))
-                        dbf_name = str(target) + ".dbf"
+                        shp_bytes = io.BytesIO(zf.read(f"{target}.shp"))
+                        dbf_name = f"{target}.dbf"
                         dbf_bytes = io.BytesIO(zf.read(dbf_name)) if dbf_name in names else None
-                        shx_name = str(target) + ".shx"
+                        shx_name = f"{target}.shx"
                         shx_bytes = io.BytesIO(zf.read(shx_name)) if shx_name in names else None
                         return pyshp.Reader(shp=shp_bytes, dbf=dbf_bytes, shx=shx_bytes)
             except Exception:
@@ -824,6 +1077,210 @@ class MultimodalDBApp:
         columns = ["id", "article_id", "file_name", "relative_path", "extension", "category", "is_python", "file_size_bytes", "sha256"]
         data = self.conn.execute("SELECT id, article_id, file_name, relative_path, extension, category, is_python, file_size_bytes, sha256 FROM article_files ORDER BY id LIMIT 50").fetchall()
         self.set_table_view(self.articles_table, columns, data)
+
+
+class RowFormDialog(Toplevel):
+    """Formulaire générique pour ajouter ou modifier une ligne d'une table."""
+
+    def __init__(self, master, title, columns, initial_values=None, on_submit=None):
+        super().__init__(master)
+        self.title(title)
+        self.resizable(False, False)
+        self.on_submit = on_submit
+        self.entries = {}
+        initial_values = initial_values or {}
+
+        fields_frame = ttk.Frame(self, padding=14)
+        fields_frame.pack(fill="both", expand=True)
+        for row_idx, column in enumerate(columns):
+            ttk.Label(fields_frame, text=column).grid(row=row_idx, column=0, sticky="w", padx=(0, 10), pady=4)
+            entry = Entry(fields_frame, width=42)
+            value = initial_values.get(column)
+            if value is not None:
+                entry.insert(0, str(value))
+            entry.grid(row=row_idx, column=1, pady=4)
+            self.entries[column] = entry
+
+        button_row = ttk.Frame(self, padding=(14, 0, 14, 14))
+        button_row.pack(fill="x")
+        ttk.Button(button_row, text="Enregistrer", command=self._submit).pack(side="right")
+        ttk.Button(button_row, text="Annuler", command=self.destroy).pack(side="right", padx=(0, 8))
+
+        self.transient(master)
+        self.grab_set()
+
+    def _submit(self):
+        values = {column: entry.get() for column, entry in self.entries.items()}
+        if self.on_submit:
+            self.on_submit(values)
+        self.destroy()
+
+
+COLUMN_TYPES = ["TEXT", "INTEGER", "REAL", "BLOB", "NUMERIC"]
+
+
+class CreateTableDialog(Toplevel):
+    """Formulaire de création d'une nouvelle table (nom + colonnes)."""
+
+    def __init__(self, master, on_submit, max_columns=8):
+        super().__init__(master)
+        self.title("Créer une nouvelle table")
+        self.resizable(False, False)
+        self.on_submit = on_submit
+
+        container = ttk.Frame(self, padding=14)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container, text="Nom de la table").grid(row=0, column=0, sticky="w", pady=4)
+        self.table_name_entry = Entry(container, width=30)
+        self.table_name_entry.grid(row=0, column=1, columnspan=2, pady=4, sticky="w")
+
+        ttk.Label(container, text="Colonnes (id auto-incrémenté ajouté automatiquement)").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(10, 4)
+        )
+
+        self.column_rows = []
+        for i in range(max_columns):
+            name_entry = Entry(container, width=22)
+            name_entry.grid(row=2 + i, column=0, pady=2, sticky="w")
+            type_var = StringVar(value="TEXT")
+            ttk.Combobox(container, textvariable=type_var, state="readonly", width=12, values=COLUMN_TYPES).grid(
+                row=2 + i, column=1, pady=2, sticky="w"
+            )
+            self.column_rows.append((name_entry, type_var))
+
+        button_row = ttk.Frame(self, padding=(14, 0, 14, 14))
+        button_row.pack(fill="x")
+        ttk.Button(button_row, text="Créer", command=self._submit).pack(side="right")
+        ttk.Button(button_row, text="Annuler", command=self.destroy).pack(side="right", padx=(0, 8))
+
+        self.transient(master)
+        self.grab_set()
+
+    def _submit(self):
+        table_name = self.table_name_entry.get().strip()
+        columns = [
+            (name_entry.get().strip(), type_var.get())
+            for name_entry, type_var in self.column_rows
+            if name_entry.get().strip()
+        ]
+        self.on_submit(table_name, columns)
+        self.destroy()
+
+
+class AlterTableDialog(Toplevel):
+    """Fenêtre de modification de structure : ajout/suppression de colonne, renommage de table."""
+
+    def __init__(self, master, table_name, columns, on_add_column, on_drop_column, on_rename_table):
+        super().__init__(master)
+        self.title(f"Modifier la structure — {table_name}")
+        self.resizable(False, False)
+
+        container = ttk.Frame(self, padding=14)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container, text="Ajouter une colonne", font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+        self.add_name_entry = Entry(container, width=20)
+        self.add_name_entry.grid(row=1, column=0, sticky="w", pady=2)
+        self.add_type_var = StringVar(value="TEXT")
+        ttk.Combobox(container, textvariable=self.add_type_var, state="readonly", width=12, values=COLUMN_TYPES).grid(
+            row=1, column=1, sticky="w", pady=2
+        )
+        ttk.Button(
+            container, text="Ajouter",
+            command=lambda: on_add_column(self.add_name_entry.get().strip(), self.add_type_var.get()),
+        ).grid(row=1, column=2, padx=(8, 0))
+
+        ttk.Label(container, text="Supprimer une colonne", font=("Segoe UI", 10, "bold")).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(14, 4)
+        )
+        self.drop_col_var = StringVar(value=columns[0] if columns else "")
+        ttk.Combobox(container, textvariable=self.drop_col_var, state="readonly", width=20, values=columns).grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        ttk.Button(container, text="Supprimer", command=lambda: on_drop_column(self.drop_col_var.get())).grid(
+            row=3, column=2, padx=(8, 0)
+        )
+
+        ttk.Label(container, text="Renommer la table", font=("Segoe UI", 10, "bold")).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(14, 4)
+        )
+        self.rename_entry = Entry(container, width=20)
+        self.rename_entry.grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Button(container, text="Renommer", command=lambda: on_rename_table(self.rename_entry.get().strip())).grid(
+            row=5, column=2, padx=(8, 0)
+        )
+
+        ttk.Button(self, text="Fermer", command=self.destroy).pack(pady=(0, 12))
+        self.transient(master)
+        self.grab_set()
+
+
+class SqlConsoleWindow(Toplevel):
+    """Console d'exécution de requêtes SQL libres sur la base ouverte."""
+
+    def __init__(self, master, conn, on_change=None):
+        super().__init__(master)
+        self.title("Console SQL")
+        self.geometry("800x560")
+        self.conn = conn
+        self.on_change = on_change
+
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="Requête SQL (SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP...)").pack(anchor="w")
+        self.sql_text = Text(top, height=6, wrap="word")
+        self.sql_text.pack(fill="x", pady=(4, 6))
+        ttk.Button(top, text="Exécuter", command=self.execute_sql).pack(anchor="e")
+
+        result_container = ttk.Frame(self, padding=(10, 0, 10, 10))
+        result_container.pack(fill="both", expand=True)
+        result_container.rowconfigure(0, weight=1)
+        result_container.columnconfigure(0, weight=1)
+
+        vsb = ttk.Scrollbar(result_container, orient="vertical")
+        hsb = ttk.Scrollbar(result_container, orient="horizontal")
+        self.result_tree = ttk.Treeview(result_container, show="headings", yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.configure(command=self.result_tree.yview)
+        hsb.configure(command=self.result_tree.xview)
+        self.result_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        self.status_var = StringVar(value="")
+        ttk.Label(self, textvariable=self.status_var, padding=(10, 0, 10, 10)).pack(anchor="w")
+
+        self.transient(master)
+
+    def execute_sql(self):
+        sql_text = self.sql_text.get("1.0", END).strip()
+        if not sql_text:
+            return
+        for child in self.result_tree.get_children():
+            self.result_tree.delete(child)
+        self.result_tree.configure(columns=())
+        try:
+            cursor = self.conn.execute(sql_text)
+            if cursor.description:
+                columns = [d[0] for d in cursor.description]
+                rows = cursor.fetchall()
+                self.result_tree.configure(columns=columns)
+                for col in columns:
+                    self.result_tree.heading(col, text=col)
+                    self.result_tree.column(col, width=120, anchor="w")
+                for row in rows:
+                    values = ["" if v is None else str(v) for v in row]
+                    self.result_tree.insert("", "end", values=values)
+                self.status_var.set(f"{len(rows)} ligne(s) retournée(s).")
+            else:
+                self.conn.commit()
+                self.status_var.set(f"Requête exécutée ({cursor.rowcount} ligne(s) affectée(s)).")
+                if self.on_change:
+                    self.on_change()
+        except Exception as exc:
+            messagebox.showerror("Erreur SQL", str(exc))
 
 
 class PresentationWindow:

@@ -1,5 +1,7 @@
 .venv/
 .venv_tf/
+.venv*/
+**/.venv*/
 __pycache__/
 .vscode/
 .idea/
@@ -9,3 +11,16 @@ __pycache__/
 *.log
 catboost_info/
 *.tmp
+
+# Donnees volumineuses/regenerables : non versionnees (voir scripts/ pour les reconstruire)
+data/
+point_eau_pastoraux/
+production-agricole-2003-2012/
+unites_pastorales-2/
+production-agricole-2003-2012 (2).zip
+
+# Secrets : ne jamais committer les identifiants de connexion
+config/sqlite_auth.py
+
+# Config d'agent/outillage locale, non necessaire au projet publie
+.github/
